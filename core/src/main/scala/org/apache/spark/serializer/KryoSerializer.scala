@@ -39,40 +39,48 @@ class KryoSerializer(conf: SparkConf) extends org.apache.spark.serializer.Serial
     conf.getInt("spark.kryoserializer.buffer.mb", 2) * 1024 * 1024
   }
 
-  def newKryoOutput() = new KryoOutput(bufferSize)
+  object newKryoOutput extends ThreadLocal[KryoOutput] {
+    override def initialValue: KryoOutput = new KryoOutput(bufferSize, -1)
+  }
 
-  def newKryo(): Kryo = {
-    val instantiator = new EmptyScalaKryoInstantiator
-    val kryo = instantiator.newKryo()
-    val classLoader = Thread.currentThread.getContextClassLoader
+  object newKryoInput extends ThreadLocal[KryoInput] {
+    override def initialValue: KryoInput = new KryoInput(bufferSize)
+  }
 
-    // Allow disabling Kryo reference tracking if user knows their object graphs don't have loops.
-    // Do this before we invoke the user registrator so the user registrator can override this.
-    kryo.setReferences(conf.getBoolean("spark.kryo.referenceTracking", true))
-
-    for (cls <- KryoSerializer.toRegister) kryo.register(cls)
-
-    // Allow sending SerializableWritable
-    kryo.register(classOf[SerializableWritable[_]], new KryoJavaSerializer())
-    kryo.register(classOf[HttpBroadcast[_]], new KryoJavaSerializer())
-
-    // Allow the user to register their own classes by setting spark.kryo.registrator
-    try {
-      for (regCls <- conf.getOption("spark.kryo.registrator")) {
-        logDebug("Running user registrator: " + regCls)
-        val reg = Class.forName(regCls, true, classLoader).newInstance().asInstanceOf[KryoRegistrator]
-        reg.registerClasses(kryo)
+  object newKryo extends ThreadLocal[Kryo] {
+    override def initialValue: Kryo = {
+      val instantiator = new EmptyScalaKryoInstantiator
+      val kryo = instantiator.newKryo()
+      val classLoader = Thread.currentThread.getContextClassLoader
+  
+      // Allow disabling Kryo reference tracking if user knows their object graphs don't have loops.
+      // Do this before we invoke the user registrator so the user registrator can override this.
+      kryo.setReferences(conf.getBoolean("spark.kryo.referenceTracking", true))
+  
+      for (cls <- KryoSerializer.toRegister) kryo.register(cls)
+  
+      // Allow sending SerializableWritable
+      kryo.register(classOf[SerializableWritable[_]], new KryoJavaSerializer())
+      kryo.register(classOf[HttpBroadcast[_]], new KryoJavaSerializer())
+  
+      // Allow the user to register their own classes by setting spark.kryo.registrator
+      try {
+        for (regCls <- conf.getOption("spark.kryo.registrator")) {
+          logDebug("Running user registrator: " + regCls)
+          val reg = Class.forName(regCls, true, classLoader).newInstance().asInstanceOf[KryoRegistrator]
+          reg.registerClasses(kryo)
+        }
+      } catch {
+        case e: Exception => logError("Failed to run spark.kryo.registrator", e)
       }
-    } catch {
-      case e: Exception => logError("Failed to run spark.kryo.registrator", e)
+  
+      // Register Chill's classes; we do this after our ranges and the user's own classes to let
+      // our code override the generic serialziers in Chill for things like Seq
+      new AllScalaRegistrar().apply(kryo)
+  
+      kryo.setClassLoader(classLoader)
+      kryo
     }
-
-    // Register Chill's classes; we do this after our ranges and the user's own classes to let
-    // our code override the generic serialziers in Chill for things like Seq
-    new AllScalaRegistrar().apply(kryo)
-
-    kryo.setClassLoader(classLoader)
-    kryo
   }
 
   def newInstance(): SerializerInstance = {
@@ -113,11 +121,11 @@ class KryoDeserializationStream(kryo: Kryo, inStream: InputStream) extends Deser
 }
 
 private[spark] class KryoSerializerInstance(ks: KryoSerializer) extends SerializerInstance {
-  val kryo = ks.newKryo()
+  val kryo = ks.newKryo.get
 
   // Make these lazy vals to avoid creating a buffer unless we use them
-  lazy val output = ks.newKryoOutput()
-  lazy val input = new KryoInput()
+  lazy val output = ks.newKryoOutput.get
+  lazy val input = ks.newKryoInput.get
 
   def serialize[T](t: T): ByteBuffer = {
     output.clear()
